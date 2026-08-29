@@ -1,0 +1,23 @@
+# ── Environment files ──
+# Never commit real keys. Keep the template (.example) but ignore everything else.
+.env
+.env.*
+!.env.proxy.example
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── Runtime data (SQLite memory DB + backups) ──
+*.db
+*.db-shm
+*.db-wal
+*.db.bak
+
+# ── OS / editor ──
+.DS_Store
+*.log
