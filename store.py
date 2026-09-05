@@ -17,6 +17,7 @@ Why SQLite (from the original codebase):
 
 import sqlite3
 import json
+import re
 import time
 
 
@@ -169,6 +170,18 @@ class MemoryStore:
         self.db.execute("INSERT INTO atoms_fts(atoms_fts) VALUES('rebuild')")
         self.db.commit()
 
+    def _fts_query(self, text: str) -> str:
+        """Turn free text into a safe FTS5 MATCH query.
+
+        Raw user text can contain FTS5 query-syntax characters (apostrophes,
+        quotes, parentheses, reserved words, etc.) which make `MATCH` raise
+        `fts5: syntax error near ...`. We neutralize them by wrapping each
+        whitespace-delimited token in double quotes (an AND of quoted phrases);
+        double quotes inside a token are escaped by doubling.
+        """
+        tokens = [t for t in text.split() if t.strip()]
+        return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+
     def search_atoms(self, query: str, limit: int = 5) -> list[dict]:
         """BM25 search on L1 atoms via FTS5."""
         if not query.strip():
@@ -188,7 +201,7 @@ class MemoryStore:
             WHERE atoms_fts MATCH ?
             ORDER BY rank LIMIT ?
             """,
-            (query, limit),
+            (self._fts_query(query), limit),
         ).fetchall()
         return [dict(r) for r in rows]
 

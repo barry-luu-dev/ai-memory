@@ -25,10 +25,11 @@ Launch Claude Code with:
 
 import os
 import json
+import time
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from store import MemoryStore
 from extract import extract_atoms, deduplicate_atoms
@@ -68,6 +69,10 @@ SKIP_REQUEST_HEADERS = {
     "content-length",
     "transfer-encoding",
     "connection",
+    # auth — never forwarded. The proxy authenticates upstream itself via
+    # x-api-key (UPSTREAM_API_KEY); the client's dummy "Bearer <token>" is
+    # only for talking to the proxy, not to the real provider.
+    "authorization",
     # internal identity headers — never forwarded upstream
     "x-tdai-user-key",
     "x-conversation-id",
@@ -130,19 +135,29 @@ def is_fresh_conversation(messages: list) -> bool:
 
 
 def build_memory_confirm_form() -> dict:
-    """Build the AskUserQuestion tool_use for the memory-confirm step."""
+    """Build the AskUserQuestion tool_use for the memory-confirm step.
+
+    AskUserQuestion's input MUST be wrapped in a top-level `questions` array
+    (each item: question/header/options/multiSelect). Claude Code validates the
+    tool input against this schema and rejects it with "Invalid tool parameters"
+    if `questions` is missing.
+    """
     return {
         "type": "tool_use",
         "id": TOOLCALL_PREFIX + "memory_confirm",
         "name": TOOL_NAME,
         "input": {
-            "question": "Connect this session to your memory?" + SKIP_HINT,
-            "header": "MyMemory",
-            "options": [
-                {"label": MEMORY_YES, "description": "Inject + capture memory for this session"},
-                {"label": MEMORY_NO, "description": "Pass through, no memory"},
+            "questions": [
+                {
+                    "question": "Connect this session to your memory?" + SKIP_HINT,
+                    "header": "MyMemory",
+                    "options": [
+                        {"label": MEMORY_YES, "description": "Inject + capture memory for this session"},
+                        {"label": MEMORY_NO, "description": "Pass through, no memory"},
+                    ],
+                    "multiSelect": False,
+                }
             ],
-            "multiSelect": False,
         },
     }
 
@@ -258,27 +273,122 @@ def _inject_memory(body: dict, context: str) -> dict:
 
 # ── SSE streaming forward ──
 
-async def _forward_stream(body: dict, headers: dict):
-    """Forward to Anthropic with filtered headers, stream SSE back."""
+def _upstream_headers(headers: dict) -> dict:
+    """Build forwarded request headers, adding auth + API version."""
     upstream_headers = filter_request_headers(headers)
     upstream_headers["x-api-key"] = UPSTREAM_KEY
     upstream_headers["anthropic-version"] = headers.get("anthropic-version", "2023-06-01")
+    return upstream_headers
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream(
-            "POST", f"{UPSTREAM_BASE}/v1/messages",
-            json=body, headers=upstream_headers,
-        ) as resp:
-            # Pass through filtered response headers
-            yield json.dumps({"__status": resp.status_code, "__headers": filter_response_headers(dict(resp.headers))}) + "\n"
+
+async def _open_upstream(body: dict, headers: dict):
+    """Open a streaming connection to the upstream provider.
+
+    Returns an (httpx.AsyncClient, httpx.Response) pair. The caller owns both
+    and MUST close them (resp.aclose() / client.aclose()) when finished.
+    """
+    client = httpx.AsyncClient(timeout=None)
+    req = client.build_request(
+        "POST", f"{UPSTREAM_BASE}/v1/messages",
+        json=body, headers=_upstream_headers(headers),
+    )
+    resp = await client.send(req, stream=True)
+    return client, resp
+
+
+async def _relay_upstream_body(client, resp):
+    """Close the stream and return the upstream body as a plain Response.
+
+    Used for non-2xx errors and for non-streaming (JSON) requests, so the real
+    HTTP status and content-type are preserved instead of being forced to SSE.
+    """
+    raw = await resp.aread()
+    ctype = resp.headers.get("content-type") or "application/json"
+    status = resp.status_code
+    await resp.aclose()
+    await client.aclose()
+    return Response(content=raw, status_code=status, media_type=ctype)
+
+
+async def _forward(body: dict, headers: dict, on_text=None, after_stream=None):
+    """Forward a request upstream and return an appropriate Response.
+
+    - upstream non-2xx    → relayed as a real error (status + JSON content-type)
+    - upstream non-stream → relayed as plain JSON
+    - upstream streaming  → Streamed back as SSE (text/event-stream)
+
+    on_text(fragment) is called per text_delta while streaming.
+    after_stream() is called after a successful streaming turn (for capture).
+    """
+    client, resp = await _open_upstream(body, headers)
+
+    if not (200 <= resp.status_code < 300):
+        print(f"[{time.time():.3f}] upstream error HTTP {resp.status_code}")
+        return await _relay_upstream_body(client, resp)
+
+    # Non-streaming request → upstream returns a single JSON body.
+    if not body.get("stream", False):
+        return await _relay_upstream_body(client, resp)
+
+    def _collect_event(raw_event: bytes):
+        """Parse one complete SSE event block, feeding text deltas to on_text.
+
+        SSE events can be split across network chunks, so this is only called
+        once a full event (terminated by a blank line) has been buffered. This
+        avoids truncated-JSON errors and ensures the assistant text is captured
+        completely for memory.
+        """
+        if on_text is None:
+            return
+        text = raw_event.decode("utf-8", errors="ignore")
+        for line in text.splitlines():
+            if line.startswith("data: "):
+                payload = line[6:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    evt = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if evt.get("type") == "content_block_delta":
+                    delta = evt.get("delta", {})
+                    if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                        t = delta.get("text")
+                        if t:
+                            on_text(t)
+
+    async def stream():
+        buffer = bytearray()
+        try:
             async for chunk in resp.aiter_bytes():
+                buffer.extend(chunk)
+                # Emit every complete SSE event (delimited by a blank line).
+                while True:
+                    sep = buffer.find(b"\n\n")
+                    if sep == -1:
+                        break
+                    _collect_event(bytes(buffer[:sep]))
+                    del buffer[:sep + 2]
                 yield chunk
+            # Flush any final event at end of stream.
+            if buffer:
+                _collect_event(bytes(buffer))
+                buffer.clear()
+        finally:
+            await resp.aclose()
+            await client.aclose()
+        # Only capture after a clean, complete stream.
+        if after_stream is not None:
+            after_stream()
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 # ── Main endpoint ──
 
 @app.post("/v1/messages")
 async def messages(request: Request):
+    print(f"[{time.time():.3f}] /v1/messages called")
     body = await request.json()
     headers = dict(request.headers)
     session_key = resolve_session_key(headers)
@@ -288,45 +398,85 @@ async def messages(request: Request):
     messages_list = body.get("messages", [])
 
     if state == "uninitialized" and is_fresh_conversation(messages_list):
-        # Inject the AskUserQuestion form as the assistant's first response
+        # Inject the AskUserQuestion form as the assistant's first response.
+        # Faithful port of buildFormResponse() from claude-code/form.ts:
+        #   - proper SSE framing: "event: <type>\ndata: <json>\n\n"
+        #   - a thinking block BEFORE the tool_use (DeepSeek requires the
+        #     prior assistant turn to carry content[].thinking after a tool call)
+        #   - tool_use input streamed via input_json_delta
         _session_state[session_key] = "pending_confirm"
+        print(f"[{time.time():.3f}] session={session_key} FRESH -> sending AskUserQuestion form (state=pending_confirm)")
         form = build_memory_confirm_form()
-        return StreamingResponse(
-            iter([json.dumps({
+        msg_id = "msg_cc_session_init_" + str(int(time.time() * 1000))
+        tool_use_id = TOOLCALL_PREFIX + str(int(time.time() * 1000))
+        input_json = json.dumps(form["input"])
+
+        def sse(event: str, data: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+        events = [
+            sse("message_start", {
                 "type": "message_start",
-                "message": {"id": "msg_session_init", "role": "assistant", "content": []},
-            }) + "\n",
-            json.dumps({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": form,
-            }) + "\n",
-            json.dumps({
-                "type": "content_block_stop",
-                "index": 0,
-            }) + "\n",
-            json.dumps({
+                "message": {
+                    "id": msg_id, "type": "message", "role": "assistant",
+                    "model": "unknown", "content": [],
+                    "stop_reason": None, "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            }),
+            # thinking block must precede tool_use
+            sse("content_block_start", {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""},
+            }),
+            sse("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "[proxy session-init form]"},
+            }),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            # tool_use block
+            sse("content_block_start", {
+                "type": "content_block_start", "index": 1,
+                "content_block": {"type": "tool_use", "id": tool_use_id, "name": TOOL_NAME, "input": {}},
+            }),
+            sse("content_block_delta", {
+                "type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": input_json},
+            }),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 1}),
+            sse("message_delta", {
                 "type": "message_delta",
                 "delta": {"stop_reason": "tool_use", "stop_sequence": None},
-            }) + "\n",
-            json.dumps({"type": "message_stop"}) + "\n"]),
+                "usage": {"output_tokens": 0},
+            }),
+            sse("message_stop", {"type": "message_stop"}),
+        ]
+        return StreamingResponse(
+            iter(["".join(events)]),
             media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
     # ── Session init: pending → parse the answer ──
     if state == "pending_confirm":
         # Look for the tool_result in the last user/tool message
+        answered = None
         for m in reversed(messages_list):
             if m.get("role") == "tool":
-                answer = extract_memory_confirm_answer(m.get("content"))
+                content = m.get("content")
+                preview = content if isinstance(content, str) else json.dumps(content)[:200]
+                answer = extract_memory_confirm_answer(content)
+                print(f"[{time.time():.3f}] session={session_key} pending_confirm found tool msg -> answer={answer!r} content={preview!r}")
                 if answer:
+                    answered = answer
                     if "yes" in answer.lower() or "use my memory" in answer.lower():
                         _session_state[session_key] = "initialized"
                     else:
                         _session_state[session_key] = "skipped"
                     break
-        # If still pending (no tool_result yet), default to on
+        # If still pending (no answer found), default to on
         if _session_state.get(session_key) == "pending_confirm":
+            print(f"[{time.time():.3f}] session={session_key} pending_confirm no answer (answered={answered!r}, n_msgs={len(messages_list)}) -> auto-initializing")
             _session_state[session_key] = "initialized"
 
     memory_enabled = _session_state.get(session_key) == "initialized"
@@ -334,10 +484,7 @@ async def messages(request: Request):
     # ── Classify — skip internal CC requests ──
     kind = classify_cc_request(body)
     if kind != "main":
-        return StreamingResponse(
-            _forward_stream(body, headers),
-            media_type="text/event-stream",
-        )
+        return await _forward(body, headers)
 
     # ── Extract real user text ──
     last_user = None
@@ -354,25 +501,12 @@ async def messages(request: Request):
     body = _inject_memory(body, context)
 
     # ── Forward + stream back ──
-    async def generate():
-        assistant_text = []
-        async for chunk in _forward_stream(body, headers):
-            text = chunk.decode("utf-8", errors="ignore")
-            for line in text.splitlines():
-                if line.startswith("data: "):
-                    payload = line[6:]
-                    if payload == "[DONE]":
-                        continue
-                    try:
-                        evt = json.loads(payload)
-                        if evt.get("type") == "content_block_delta":
-                            delta = evt.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                assistant_text.append(delta.get("text", ""))
-                    except json.JSONDecodeError:
-                        pass
-            yield chunk
+    assistant_text: list[str] = []
 
+    def _on_text(t: str):
+        assistant_text.append(t)
+
+    def _after_stream():
         # Capture the turn (only if memory enabled)
         if memory_enabled and user_text and assistant_text:
             store.add_conversation(session_key, [
@@ -387,7 +521,7 @@ async def messages(request: Request):
                 if _extraction_counters[session_key] % AGGREGATE_EVERY_N == 0:
                     _run_aggregation(session_key)
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return await _forward(body, headers, on_text=_on_text, after_stream=_after_stream)
 
 
 @app.get("/health")
