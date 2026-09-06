@@ -317,8 +317,9 @@ async def _forward(body: dict, headers: dict, on_text=None, after_stream=None):
     - upstream non-stream → relayed as plain JSON
     - upstream streaming  → Streamed back as SSE (text/event-stream)
 
-    on_text(fragment) is called per text_delta while streaming.
-    after_stream() is called after a successful streaming turn (for capture).
+    on_text(fragment) is called per text_delta / finalised tool_use while
+    streaming. after_stream() is called after a successful streaming turn
+    (for capture).
     """
     client, resp = await _open_upstream(body, headers)
 
@@ -330,49 +331,120 @@ async def _forward(body: dict, headers: dict, on_text=None, after_stream=None):
     if not body.get("stream", False):
         return await _relay_upstream_body(client, resp)
 
-    def _collect_event(raw_event: bytes):
-        """Parse one complete SSE event block, feeding text deltas to on_text.
+    # Per-stream accumulation state — a tool_use block arrives as several
+    # fragments (content_block_start → input_json_delta* → content_block_stop).
+    tool_names: dict[int, str] = {}
+    tool_jsons: dict[int, str] = {}
 
-        SSE events can be split across network chunks, so this is only called
-        once a full event (terminated by a blank line) has been buffered. This
-        avoids truncated-JSON errors and ensures the assistant text is captured
-        completely for memory.
+    def _capture(evt: dict):
+        """Feed text_delta / tool_use events to on_text for memory capture.
+
+        Also reconstructs tool calls so a turn where the model only calls a
+        tool (no prose) is still captured into L0 instead of being dropped.
         """
         if on_text is None:
             return
-        text = raw_event.decode("utf-8", errors="ignore")
-        for line in text.splitlines():
+        et = evt.get("type")
+        if et == "content_block_start":
+            block = evt.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                idx = evt.get("index")
+                if isinstance(idx, int):
+                    tool_names[idx] = str(block.get("name", ""))
+                    tool_jsons[idx] = ""
+        elif et == "content_block_delta":
+            delta = evt.get("delta") or {}
+            dt = delta.get("type")
+            if dt == "text_delta":
+                t = delta.get("text")
+                if isinstance(t, str) and t:
+                    on_text(t)
+            elif dt == "input_json_delta":
+                idx = evt.get("index")
+                pj = delta.get("partial_json")
+                if isinstance(idx, int) and isinstance(pj, str) and idx in tool_jsons:
+                    tool_jsons[idx] += pj
+        elif et == "content_block_stop":
+            idx = evt.get("index")
+            if isinstance(idx, int) and idx in tool_names:
+                name = tool_names.pop(idx, "")
+                args = tool_jsons.pop(idx, "")
+                if name:
+                    # Represent the tool call as text so it lands in memory.
+                    on_text(f"\n[tool_use: {name}] {args}")
+
+    def _patch_thinking(evt: dict) -> bool:
+        """Force missing/null/non-string 'thinking' to '' (DeepSeek SSE fix).
+
+        Faithful port of createSseThinkingFixStream() from anthropicHandler.ts:
+        Claude Code does `contentBlock.thinking += delta.thinking`, which
+        crashes on a non-string value, and DeepSeek may emit thinking blocks
+        with a missing/invalid `thinking` field.
+        """
+        et = evt.get("type")
+        if et == "content_block_start":
+            block = evt.get("content_block")
+            if isinstance(block, dict) and block.get("type") == "thinking":
+                if not isinstance(block.get("thinking"), str):
+                    block["thinking"] = ""
+                    return True
+        elif et == "content_block_delta":
+            delta = evt.get("delta")
+            if isinstance(delta, dict) and delta.get("type") == "thinking_delta":
+                if not isinstance(delta.get("thinking"), str):
+                    delta["thinking"] = ""
+                    return True
+        return False
+
+    def _process_event(event_bytes: bytes) -> bytes:
+        """Parse one complete SSE event, patch thinking, capture text/tools,
+        and return the (possibly patched) bytes to relay to the client."""
+        text = event_bytes.decode("utf-8", errors="ignore")
+        lines = text.splitlines()
+        data_idx = None
+        data_str = None
+        for i, line in enumerate(lines):
             if line.startswith("data: "):
-                payload = line[6:].strip()
-                if not payload or payload == "[DONE]":
-                    continue
-                try:
-                    evt = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                if evt.get("type") == "content_block_delta":
-                    delta = evt.get("delta", {})
-                    if isinstance(delta, dict) and delta.get("type") == "text_delta":
-                        t = delta.get("text")
-                        if t:
-                            on_text(t)
+                data_idx = i
+                data_str = line[6:].strip()
+        # No JSON payload (event-only line / empty / [DONE]) → relay untouched.
+        if data_idx is None or not data_str or data_str == "[DONE]":
+            return event_bytes + b"\n\n"
+        try:
+            evt = json.loads(data_str)
+        except json.JSONDecodeError:
+            return event_bytes + b"\n\n"
+        if not isinstance(evt, dict):
+            return event_bytes + b"\n\n"
+
+        # Memory capture (text_delta + tool_use reconstruction).
+        _capture(evt)
+
+        # DeepSeek thinking fix (in-band, re-serialised only when patched).
+        if _patch_thinking(evt):
+            new_data = "data: " + json.dumps(evt)
+            new_lines = [new_data if i == data_idx else l for i, l in enumerate(lines)]
+            return ("\n".join(new_lines) + "\n\n").encode("utf-8")
+
+        return event_bytes + b"\n\n"
 
     async def stream():
         buffer = bytearray()
         try:
             async for chunk in resp.aiter_bytes():
                 buffer.extend(chunk)
-                # Emit every complete SSE event (delimited by a blank line).
+                # Emit every complete SSE event (delimited by a blank line),
+                # re-serialised so thinking patches are applied in-band.
                 while True:
                     sep = buffer.find(b"\n\n")
                     if sep == -1:
                         break
-                    _collect_event(bytes(buffer[:sep]))
+                    evt_bytes = bytes(buffer[:sep])
                     del buffer[:sep + 2]
-                yield chunk
+                    yield _process_event(evt_bytes)
             # Flush any final event at end of stream.
             if buffer:
-                _collect_event(bytes(buffer))
+                yield _process_event(bytes(buffer))
                 buffer.clear()
         finally:
             await resp.aclose()
@@ -504,6 +576,8 @@ async def messages(request: Request):
     assistant_text: list[str] = []
 
     def _on_text(t: str):
+        # DEBUG: watch captured text_delta chunks / tool_use as they arrive
+        print(f"[{time.time():.3f}] capture {len(t)} chars: {t[:200]!r}")
         assistant_text.append(t)
 
     def _after_stream():

@@ -14,36 +14,76 @@ from openai import OpenAI
 
 # ── System prompts (adapted from MemoryCore's l1-extraction prompts) ──
 
-EXTRACTION_SYSTEM_PROMPT = """You are a memory extraction engine. Your job is to read
-conversation messages and extract durable facts, preferences, decisions, and events
-that are worth remembering for future conversations.
+EXTRACTION_SYSTEM_PROMPT = """You are a memory extraction engine for a personal
+assistant. Your job is to read conversation messages and extract durable, useful
+facts that are worth remembering across future conversations.
 
-Return a JSON object with an "atoms" array. Each atom must have:
-  - "content": the fact itself (one clear, self-contained sentence)
+Return ONLY a JSON object with an "atoms" array. Each atom must be an object with:
+  - "content": the fact itself, as one clear, self-contained sentence
   - "type": one of "fact", "preference", "decision", "event"
   - "source_msg_ids": list of message IDs this was extracted from
 
-Rules:
-  - Only extract information likely to be useful in future conversations.
-  - Skip greetings, small talk, transient remarks, and chitchat.
-  - A "preference" is something the user likes/dislikes/wants.
-  - A "decision" is a conclusion or choice that was made.
-  - An "event" is something that happened (past action, milestone).
-  - A "fact" is any other durable piece of information.
-  - If nothing is worth remembering, return {"atoms": []}.
-  - Do NOT invent facts not present in the conversation.
-  - Each atom should be a single, atomic piece of information.
+Write every "content" field in the SAME language as the conversation messages.
+Keep JSON keys and the "type" values in English.
+
+## What is worth remembering
+Extract information that remains true and useful AFTER the conversation ends:
+stable attributes, likes/dislikes, conclusions, plans, and things that happened.
+
+## Rules (follow strictly)
+1. ONLY extract from the provided messages. Do NOT invent, guess, or "fill in"
+   facts that are not present or clearly implied by what was said.
+2. Make each atom self-contained: it must make sense with no surrounding context.
+   Do NOT use deictic words like "this", "that", "it", "here", "now" unless
+   unambiguous. Use "The user..." as the subject when the message is about the user.
+3. Merge strongly related or causally connected messages into ONE complete atom.
+   Do not split one fact into fragments, and do not restate the same idea twice.
+4. Skip: greetings, small talk, chitchat, transient remarks, one-off operational
+   requests ("this time...", "for now..."), repeated content, and anything that
+   is only about the assistant's own behavior or outputs.
+5. Skip pure subjective emotion or venting that carries no durable, factual content.
+
+## Type guide
+- "preference": something the user likes/dislikes/wants/values, or a habit.
+  Triggers: "I like", "I prefer", "I always", "please use X from now on".
+- "decision": a conclusion or choice that was made (a chosen option, a plan, a
+  settled outcome).
+- "event": something that objectively happened (a past action, milestone, or
+  completed activity), ideally with its time.
+- "fact": any other durable piece of information (identity, occupation, tech
+  stack, constraints, location, etc.).
+
+If nothing is worth remembering, return {"atoms": []}.
+Output ONLY valid JSON — no markdown code fences, no extra commentary.
 """
 
-DEDUP_SYSTEM_PROMPT = """You detect duplicate facts. Given a list of EXISTING facts
-and a list of NEW candidate facts, return the indices (0-based) of NEW candidates
-that are NOT duplicates of any existing fact.
+DEDUP_SYSTEM_PROMPT = """You detect duplicate or redundant facts.
 
-A duplicate means the same information expressed differently. For example:
-  "User prefers Python" and "User likes Python" are duplicates.
-  "User prefers Python" and "User uses JavaScript at work" are NOT duplicates.
+You are given a list of EXISTING facts and a list of NEW candidate facts. Decide
+which NEW candidates are worth keeping because they are NOT already covered by any
+existing fact.
 
-Return: {"keep": [0, 2, 5]} — only the indices of non-duplicate new candidates."""
+A candidate is a DUPLICATE (do NOT keep) when it expresses the SAME information as
+an existing fact, even if worded differently:
+  EXISTING: "User prefers Python"
+  NEW:      "User likes Python"            -> duplicate, drop
+
+A candidate is NOT a duplicate (KEEP it) when it adds genuinely NEW information
+that no existing fact already states — even if the topic overlaps:
+  EXISTING: "User prefers Python"
+  NEW:      "User uses JavaScript at work"              -> new info, keep
+  NEW:      "User prefers Python for data science"      -> adds a "data science"
+             qualifier not present above                -> new info, keep
+
+Decide between the existing fact and the new one: if the new candidate is more
+specific, more recent, or corrects/adds a detail absent from every existing fact,
+KEEP it. Only DROP it when it is fully implied by an existing fact and adds
+nothing new. When two facts are complementary (both true, each adds something),
+keep both rather than collapsing them.
+
+Return a JSON object: {"keep": [0, 2, 5]} — the 0-based indices of the NEW
+candidates you decided to KEEP. Output ONLY this JSON, no commentary.
+"""
 
 
 def _stable_id(content: str) -> str:

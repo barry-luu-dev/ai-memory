@@ -12,37 +12,56 @@ import json
 import hashlib
 from openai import OpenAI
 
-SCENARIO_SYSTEM_PROMPT = """You are a knowledge organizer. Given a set of memory atoms
-(facts, preferences, decisions, events), group them into logical scenarios.
+SCENARIO_SYSTEM_PROMPT = """You are a knowledge organizer for a long-term memory
+system. Given a set of memory atoms (facts, preferences, decisions, events), you
+consolidate them into a small number of coherent "scenario" documents — like the
+topics of a personal knowledge base.
 
-A scenario is a coherent topic, project, or domain that multiple atoms relate to.
-For example: "Work Projects", "Health & Fitness", "Travel Plans", "Technical Preferences".
+A scenario is a coherent topic, project, or domain that MULTIPLE atoms relate to,
+for example: "Work & Career", "Health & Fitness", "Travel Plans", "Technical
+Preferences", "Family". Each scenario summarizes what is known about that topic.
 
 Return a JSON object with a "scenarios" array. Each scenario has:
-  - "title": short descriptive name (2-5 words)
-  - "content": markdown summary synthesizing the relevant atoms into a coherent narrative
-  - "atom_ids": list of atom IDs that belong to this scenario
+  - "title": short, descriptive name (2-5 words)
+  - "content": a coherent markdown narrative that SYNTHESIZES the relevant atoms.
+    Weave the atoms into flowing prose that makes sense to someone new to the
+    topic. Do NOT just paste the atoms as a bullet list.
+  - "atom_ids": the list of atom IDs that belong to this scenario
 
 Rules:
-  - Merge related atoms; don't create a scenario for every single atom.
-  - Aim for 3-8 scenarios. If there are very few atoms, fewer is fine.
-  - Each atom should belong to exactly one scenario.
-  - Write the content as if explaining the topic to someone new.
+  - Merge related atoms into shared scenarios. Do NOT create a scenario for every
+    single atom, and do NOT fragment one topic across several scenarios.
+  - Aim for 3-8 scenarios; if there are very few atoms, fewer is fine.
+  - Assign each atom to EXACTLY ONE scenario.
+  - Do not invent facts. Only combine what the atoms actually state; if atoms
+    conflict, reflect the nuance rather than silently hiding it.
+  - Write "content" in the same language as the atoms.
+Output ONLY valid JSON — no markdown code fences, no extra commentary.
 """
 
-PERSONA_SYSTEM_PROMPT = """You are building a long-term user profile. Given a set of
-scenarios (each summarizing a topic area of the user's life/work), synthesize a
-concise persona document.
+PERSONA_SYSTEM_PROMPT = """You are building a long-term user profile ("persona")
+that will be injected into future conversations to help an AI understand the user
+quickly and answer well.
 
-The persona should cover:
+You are given a set of scenarios, each summarizing a topic area of the user's life
+or work. Synthesize a concise persona document.
+
+Cover what the evidence supports:
   - Core preferences and values
   - Recurring patterns and habits
-  - Key facts and background
+  - Key background facts
   - Important decisions and their rationale
   - Skills and expertise areas
 
-Write in markdown with ## headings. Be concise but comprehensive. This document
-will be injected into future conversations to help an AI understand the user quickly.
+Rules:
+  - Base EVERYTHING on the provided scenarios. Do NOT invent or over-infer traits
+    with no support. If little is known yet, keep it brief rather than guessing.
+  - Weave facts into coherent prose where possible; use short headings or bullets
+    only when a list genuinely aids readability.
+  - Write in markdown with "##" headings.
+  - Be concise: the persona is injected into the context window, so keep it short
+    and dense (aim well under ~1500 characters).
+  - Write in the same language as the scenario content.
 """
 
 
