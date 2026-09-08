@@ -44,6 +44,7 @@ def run_extraction(store: MemoryStore, client: OpenAI, session_id: str):
     msgs = store.get_unprocessed_conversations(session_id, limit=20)
     if not msgs:
         print("  [no unprocessed messages]")
+        store.mark_extraction_done(session_id)
         return
 
     raw = [{"id": m["id"], "role": m["role"], "content": m["content"]} for m in msgs]
@@ -97,10 +98,6 @@ def interactive_loop():
     client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY) if LLM_BASE_URL else OpenAI(api_key=LLM_API_KEY)
     store = MemoryStore("my_memory.db")
     session_id = "default"
-
-    state = store.get_pipeline_state(session_id)
-    conv_count = state["conversation_count"]
-    extr_count = state["extraction_count"]
 
     print("=" * 60)
     print("  MyMemory — Personal AI Memory System")
@@ -161,7 +158,6 @@ def interactive_loop():
             {"role": "user", "content": user_input},
             {"role": "assistant", "content": assistant_response},
         ])
-        conv_count += 1
 
         # Show memory context
         if context:
@@ -171,15 +167,16 @@ def interactive_loop():
         print(f"\nAssistant: {assistant_response}")
 
         # ── L1: extract every N conversations ──
-        if conv_count % EXTRACT_EVERY_N == 0:
+        # Driven by the PERSISTED pipeline_state (single source of truth), so
+        # the cadence continues across restarts like TencentDB's scheduler.
+        if store.get_pipeline_state(session_id)["conversation_count"] % EXTRACT_EVERY_N == 0:
             print("  [triggering extraction...]")
             run_extraction(store, client, session_id)
-            extr_count += 1
 
-        # ── L2/L3: aggregate every M extractions ──
-        if extr_count > 0 and extr_count % AGGREGATE_EVERY_N == 0:
-            print("  [triggering aggregation...]")
-            run_aggregation(store, client, session_id)
+            # ── L2/L3: aggregate every M extractions (only right after L1) ──
+            if store.get_pipeline_state(session_id)["extraction_count"] % AGGREGATE_EVERY_N == 0:
+                print("  [triggering aggregation...]")
+                run_aggregation(store, client, session_id)
 
     store.close()
 

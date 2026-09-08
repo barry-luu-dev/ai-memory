@@ -72,6 +72,13 @@ erDiagram
         REAL last_aggregation_at
     }
 
+    %% ── Per-session memory choice ──
+    session_memory {
+        TEXT session_id PK
+        INTEGER enabled "1 = memory on"
+        REAL updated_at
+    }
+
     %% ── Relationships ──
     conversations ||--o{ atoms : "source_msg_ids references"
     atoms ||--o{ scenarios : "source_atom_ids references"
@@ -86,7 +93,8 @@ erDiagram
 | **L1 index** | `atoms_fts` | FTS5 virtual table for BM25 search; `content_rowid` links to `atoms.rowid` |
 | **L2** | `scenarios` | Grouped knowledge; `source_atom_ids` (JSON) points back to L1 atom IDs |
 | **L3** | `persona` | Single-row profile distilled from scenarios |
-| **State** | `pipeline_state` | Tracks extraction/aggregation counts per session |
+| **State** | `pipeline_state` | Persisted extraction/aggregation counters — the single source of truth driving the every-N cadence (survives restarts) |
+| **Setting** | `session_memory` | Persisted per-session memory on/off choice ("connect to memory?") |
 
 > **Note:** The layer relationships are stored as **JSON arrays** (not foreign-key
 > join tables) — a simplification vs. the normalized design in the real
@@ -217,7 +225,14 @@ claude
 
 On the first message of a new session, Claude Code shows an `AskUserQuestion`
 form: **"Connect this session to your memory?"** — choose yes to enable memory
-injection + capture, or no to pass through.
+injection + capture, or no to pass through. Your choice is **persisted per
+session** (in the `session_memory` table), so an in-progress conversation keeps
+its memory setting even if the proxy restarts.
+
+For brand-new sessions you can skip the prompt entirely by setting
+`MEMORY_DEFAULT` (see below): `ask` prompts (default), `on` auto-enables memory,
+and `off` auto-skips. Internal sessions (subagent / cron / heartbeat / `temp:`)
+are always treated as memory-off and never prompted.
 
 ### Env vars (`proxy.py`)
 
@@ -231,6 +246,7 @@ injection + capture, or no to pass through.
 | `PROXY_PORT` | `8096` | Listen port |
 | `EXTRACT_EVERY_N` | `5` | Conversations per extraction |
 | `AGGREGATE_EVERY_N` | `3` | Extractions per aggregation |
+| `MEMORY_DEFAULT` | `ask` | New-session memory policy: `ask`, `on`, or `off` |
 
 ---
 
@@ -262,7 +278,7 @@ Every M extractions (default 3):
 | **LLM does the heavy lifting** | Extraction, dedup, aggregation all use the LLM |
 | **Budget cap on recall** | `MAX_CONTEXT_CHARS` prevents memory from eating context |
 | **Top-down recall** | L3 → L2 → L1: start broad, get specific |
-| **Batch triggers** | Don't extract every turn — process every N conversations |
+| **Batch triggers (persisted)** | Extract every N conversations, aggregate every M extractions — counters live in `pipeline_state`, so cadence survives restarts (like TencentDB's checkpoint) |
 | **Claude Code adapter** | Strip harness noise so you only store real user input |
 
 ## Notes & limitations
@@ -270,7 +286,11 @@ Every M extractions (default 3):
 - `proxy.py` is a **simplified** reimplementation of the real `MemoryProxy` —
   it captures the core loop (classify → extract → recall → inject → forward →
   capture) without auth, multi-agent, skills, or observability.
-- Session state in `proxy.py` is **in-memory** — it resets when the proxy restarts.
+- The per-session **memory on/off choice** and the **pipeline cadence counters**
+  are persisted in SQLite (`session_memory`, `pipeline_state`) and **survive a
+  proxy restart**. Only the transient pending-confirm state (the moment between
+  sending the "Connect to memory?" prompt and reading the answer) is in-memory
+  and resets.
 - The SSE form injection in `proxy.py` may need tuning against your Claude Code
   version.
 - Data is stored in `my_memory.db` (SQLite). Backup = copy the file.

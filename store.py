@@ -22,7 +22,7 @@ import time
 
 
 class MemoryStore:
-    def __init__(self, db_path: str = "memory.db"):
+    def __init__(self, db_path: str = "my_memory.db"):
         self.db = sqlite3.connect(db_path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")  # WAL for concurrency
@@ -81,6 +81,15 @@ class MemoryStore:
                 last_extraction_at REAL,
                 last_aggregation_at REAL
             );
+
+            -- Per-session memory on/off choice. Persisted so the user's answer
+            -- to "connect to memory?" survives a proxy restart. This mirrors
+            -- how TencentDB checkpoints per-session state to a durable store.
+            CREATE TABLE IF NOT EXISTS session_memory (
+                session_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL,
+                updated_at REAL NOT NULL
+            );
         """)
         self.db.commit()
 
@@ -127,6 +136,32 @@ class MemoryStore:
             """,
             (session_id, limit),
         ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_sessions(self) -> list[str]:
+        """List all distinct session IDs (for the UI)."""
+        rows = self.db.execute(
+            "SELECT DISTINCT session_id FROM conversations ORDER BY session_id"
+        ).fetchall()
+        return [r["session_id"] for r in rows]
+
+    def get_conversations(
+        self, session_id: str | None = None, limit: int = 200
+    ) -> list[dict]:
+        """Get raw conversations, optionally filtered by session."""
+        if session_id:
+            rows = self.db.execute(
+                "SELECT id, session_id, role, content, created_at "
+                "FROM conversations WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT id, session_id, role, content, created_at "
+                "FROM conversations ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def search_conversations(
@@ -215,6 +250,31 @@ class MemoryStore:
             "SELECT id, content, atom_type, created_at "
             "FROM atoms ORDER BY created_at DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_atoms_by_ids(self, atom_ids: list[str]) -> list[dict]:
+        """Get atoms by their IDs (for scenario → atom traceability)."""
+        if not atom_ids:
+            return []
+        placeholders = ",".join("?" for _ in atom_ids)
+        rows = self.db.execute(
+            f"SELECT id, content, atom_type, created_at "
+            f"FROM atoms WHERE id IN ({placeholders})",
+            atom_ids,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_conversations_by_ids(self, msg_ids: list[int]) -> list[dict]:
+        """Get conversations by their IDs (for atom → conversation traceability)."""
+        if not msg_ids:
+            return []
+        placeholders = ",".join("?" for _ in msg_ids)
+        rows = self.db.execute(
+            f"SELECT id, session_id, role, content, created_at "
+            f"FROM conversations WHERE id IN ({placeholders}) "
+            f"ORDER BY id ASC",
+            msg_ids,
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -307,6 +367,35 @@ class MemoryStore:
             "UPDATE pipeline_state SET last_aggregation_at = ? "
             "WHERE session_id = ?",
             (time.time(), session_id),
+        )
+        self.db.commit()
+
+    # ═══════════════════════════════════════════════════════════════
+    # Per-session memory on/off decision (survives restarts)
+    # ═══════════════════════════════════════════════════════════════
+
+    def get_memory_enabled(self, session_id: str) -> bool | None:
+        """
+        Get a session's persisted memory choice.
+
+        Returns:
+            True if memory is enabled, False if the user skipped it, or None if
+            the user has never answered for this session.
+        """
+        row = self.db.execute(
+            "SELECT enabled FROM session_memory WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return bool(row["enabled"]) if row else None
+
+    def set_memory_enabled(self, session_id: str, enabled: bool):
+        """Persist the memory on/off choice for a session (idempotent upsert)."""
+        self.db.execute(
+            "INSERT INTO session_memory (session_id, enabled, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "enabled = excluded.enabled, updated_at = excluded.updated_at",
+            (session_id, int(enabled), time.time()),
         )
         self.db.commit()
 

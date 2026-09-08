@@ -25,6 +25,7 @@ Launch Claude Code with:
 
 import os
 import json
+import re
 import time
 import httpx
 from dotenv import load_dotenv
@@ -49,6 +50,15 @@ PROXY_PORT = int(os.getenv("PROXY_PORT", "8096"))
 EXTRACT_EVERY_N = int(os.getenv("EXTRACT_EVERY_N", "5"))
 AGGREGATE_EVERY_N = int(os.getenv("AGGREGATE_EVERY_N", "3"))
 
+# Memory participation policy for BRAND-NEW sessions that have no persisted
+# choice yet (mirrors TencentDB's SessionFilter-as-config approach):
+#   "ask" -> show the AskUserQuestion form (default)
+#   "on"  -> auto-enable memory, never prompt
+#   "off" -> auto-skip memory, never prompt
+# A user's explicit yes/no answer is persisted per session (see store.py's
+# session_memory table), so it survives restarts and overrides this default.
+MEMORY_DEFAULT = os.getenv("MEMORY_DEFAULT", "ask").lower()
+
 # LLM for extraction/aggregation (OpenAI-compatible). Defaults to DeepSeek.
 # Override with LLM_BASE_URL / LLM_MODEL / LLM_API_KEY as needed.
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
@@ -58,9 +68,10 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 app = FastAPI()
 store = MemoryStore("my_memory.db")
 
-# Per-session turn counters (keyed by session key)
-_turn_counters: dict[str, int] = {}
-_extraction_counters: dict[str, int] = {}
+# NOTE: Trigger cadence is driven by the PERSISTED pipeline_state table (the
+# single source of truth), not by in-memory counters. This mirrors TencentDB's
+# checkpointed PipelineSessionState, so the every-N cadence survives restarts.
+# See store.get_pipeline_state / mark_extraction_done / mark_aggregation_done.
 
 # ── Header filtering (faithful port from anthropicHandler.ts) ──
 
@@ -109,7 +120,49 @@ def filter_response_headers(headers: dict) -> dict:
 
 # Session state machine: "uninitialized" → "pending_confirm" → "initialized"/"skipped"
 # Keyed by session key. "initialized" means memory is enabled for this session.
+# The cache is hydrated from the persisted session_memory table on first use,
+# and every explicit decision is written back, so memory-on/off survives restarts.
 _session_state: dict[str, str] = {}
+
+# Built-in session-key matchers for internal / non-user sessions, which are
+# NEVER prompted and always treated as memory-off (faithful to TencentDB's
+# SessionFilter builtin skip rules: subagent, scene-extract, temp, cron, heartbeat).
+_INTERNAL_SESSION_PATTERNS = (
+    re.compile(r":subagent:"),
+    re.compile(r":memory-scene-extract-"),
+    re.compile(r"^temp:"),
+    re.compile(r":cron:", re.IGNORECASE),
+    re.compile(r":heartbeat:", re.IGNORECASE),
+)
+
+
+def _is_internal_session(session_key: str) -> bool:
+    """True if the session is internal / non-interactive (never remembered)."""
+    return any(p.search(session_key) for p in _INTERNAL_SESSION_PATTERNS)
+
+
+def _resolve_session_state(session_key: str) -> str:
+    """
+    Resolve a session's memory state, in precedence order (mirrors TencentDB):
+      1. a persisted decision from a prior run (survives restart)
+      2. internal-session skip rule (never remembered)
+      3. the MEMORY_DEFAULT policy for brand-new sessions
+    Config-driven decisions (2/3) are NOT persisted; only explicit user choices are.
+    """
+    cached = _session_state.get(session_key)
+    if cached is not None:
+        return cached
+    persisted = store.get_memory_enabled(session_key)
+    if persisted is not None:
+        state = "initialized" if persisted else "skipped"
+    elif _is_internal_session(session_key) or MEMORY_DEFAULT == "off":
+        state = "skipped"
+    elif MEMORY_DEFAULT == "on":
+        state = "initialized"
+    else:
+        state = "uninitialized"
+    _session_state[session_key] = state
+    return state
 
 # AskUserQuestion form constants (from claude-code/form.ts)
 TOOL_NAME = "AskUserQuestion"
@@ -223,6 +276,7 @@ def _client():
 def _run_extraction(session_id: str):
     msgs = store.get_unprocessed_conversations(session_id, limit=20)
     if not msgs:
+        store.mark_extraction_done(session_id)
         return
     raw = [{"id": m["id"], "role": m["role"], "content": m["content"]} for m in msgs]
     new_atoms = extract_atoms(_client(), LLM_MODEL, raw)
@@ -465,9 +519,13 @@ async def messages(request: Request):
     headers = dict(request.headers)
     session_key = resolve_session_key(headers)
 
-    # ── Session init: fresh conversation → ask to connect memory ──
-    state = _session_state.get(session_key, "uninitialized")
+    # ── Session init ──
     messages_list = body.get("messages", [])
+
+    # Resolve this session's memory state (persisted choice → internal-skip →
+    # MEMORY_DEFAULT). A previously-answered session resumes where it left off,
+    # so an in-progress conversation keeps its memory setting across restarts.
+    state = _resolve_session_state(session_key)
 
     if state == "uninitialized" and is_fresh_conversation(messages_list):
         # Inject the AskUserQuestion form as the assistant's first response.
@@ -543,13 +601,16 @@ async def messages(request: Request):
                     answered = answer
                     if "yes" in answer.lower() or "use my memory" in answer.lower():
                         _session_state[session_key] = "initialized"
+                        store.set_memory_enabled(session_key, True)
                     else:
                         _session_state[session_key] = "skipped"
+                        store.set_memory_enabled(session_key, False)
                     break
         # If still pending (no answer found), default to on
         if _session_state.get(session_key) == "pending_confirm":
             print(f"[{time.time():.3f}] session={session_key} pending_confirm no answer (answered={answered!r}, n_msgs={len(messages_list)}) -> auto-initializing")
             _session_state[session_key] = "initialized"
+            store.set_memory_enabled(session_key, True)
 
     memory_enabled = _session_state.get(session_key) == "initialized"
 
@@ -577,7 +638,7 @@ async def messages(request: Request):
 
     def _on_text(t: str):
         # DEBUG: watch captured text_delta chunks / tool_use as they arrive
-        print(f"[{time.time():.3f}] capture {len(t)} chars: {t[:200]!r}")
+        # print(f"[{time.time():.3f}] capture {len(t)} chars: {t[:200]!r}")
         assistant_text.append(t)
 
     def _after_stream():
@@ -587,12 +648,13 @@ async def messages(request: Request):
                 {"role": "user", "content": user_text},
                 {"role": "assistant", "content": "".join(assistant_text)},
             ])
-            # Trigger extraction/aggregation
-            _turn_counters[session_key] = _turn_counters.get(session_key, 0) + 1
-            if _turn_counters[session_key] % EXTRACT_EVERY_N == 0:
-                _run_extraction(session_key)
-                _extraction_counters[session_key] = _extraction_counters.get(session_key, 0) + 1
-                if _extraction_counters[session_key] % AGGREGATE_EVERY_N == 0:
+            # Trigger extraction/aggregation from the PERSISTED pipeline_state.
+            # Single source of truth: counts survive proxy restarts, so cadence
+            # resumes where it left off (like TencentDB's checkpointed scheduler).
+            state = store.get_pipeline_state(session_key)
+            if state["conversation_count"] % EXTRACT_EVERY_N == 0:
+                _run_extraction(session_key)  # bumps pipeline_state.extraction_count
+                if store.get_pipeline_state(session_key)["extraction_count"] % AGGREGATE_EVERY_N == 0:
                     _run_aggregation(session_key)
 
     return await _forward(body, headers, on_text=_on_text, after_stream=_after_stream)
