@@ -74,6 +74,43 @@ SEED_CONVERSATIONS = [
     {"role": "user", "content": "I'm cutting out sugary drinks entirely."},
     {"role": "assistant", "content": "Solid plan. How's the family?"},
     {"role": "user", "content": "I have a daughter named Mia who's five years old."},
+
+    # Topic 6: tools & setup
+    {"role": "user", "content": "I use Neovim as my main editor — been on it for about three years now."},
+    {"role": "assistant", "content": "A Neovim user! Any particular setup?"},
+    {"role": "user", "content": "Yeah, I prefer dark themes everywhere, and I keep everything keyboard-driven."},
+
+    # Topic 7: learning goals
+    {"role": "user", "content": "I'm learning Rust in my spare time — I want to build a CLI tool with it."},
+    {"role": "assistant", "content": "Nice choice. Any other goals on the horizon?"},
+    {"role": "user", "content": "I plan to get my AWS Solutions Architect certification by December."},
+
+    # Topic 8: work preferences
+    {"role": "user", "content": "I work remotely on Tuesdays and Thursdays."},
+    {"role": "assistant", "content": "Good balance. Any meeting preferences?"},
+    {"role": "user", "content": "I don't take meetings before 10am — I need the morning to focus."},
+    {"role": "assistant", "content": "Understood, mornings are blocked."},
+    {"role": "user", "content": "I also mentor two junior engineers on the payments team."},
+
+    # Topic 9: travel plans
+    {"role": "user", "content": "I'm planning a trip to Japan in October with my wife."},
+    {"role": "assistant", "content": "Exciting! Been before?"},
+    {"role": "user", "content": "No, first time. I've never been to Europe either, but I'd love to see Iceland someday."},
+
+    # Topic 10: company events
+    {"role": "user", "content": "Big news — our startup just closed a Series A round of $10M last week."},
+    {"role": "assistant", "content": "Congratulations! That's a huge milestone."},
+    {"role": "user", "content": "Thanks, it means we're hiring aggressively next quarter."},
+
+    # Topic 11: a durable (if trivial) preference
+    {"role": "user", "content": "Random opinion: I really dislike pineapple on pizza."},
+    {"role": "assistant", "content": "Noted, strong feelings there!"},
+
+    # Topic 12: chitchat / distractors — the extractor should NOT turn these into atoms
+    {"role": "user", "content": "Haha, that's a fair point. Anyway, let's talk later."},
+    {"role": "assistant", "content": "Sure, anytime! Have a good one."},
+    {"role": "user", "content": "Cool, catch you tomorrow."},
+    {"role": "assistant", "content": "See you!"},
 ]
 
 
