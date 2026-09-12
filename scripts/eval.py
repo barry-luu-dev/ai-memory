@@ -45,22 +45,23 @@ import argparse
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from store import MemoryStore
-from recall import recall, format_for_system_prompt, MAX_CONTEXT_CHARS
-from extract import extract_atoms, deduplicate_atoms
-from aggregate import build_scenarios, build_persona
-from test_pipeline import SEED_CONVERSATIONS  # shared frozen corpus
-
 # Make the repo root importable (store/recall/extract/aggregate) and the
 # scripts dir importable (test_pipeline for the shared seed corpus).
+# This MUST run before the local imports below — otherwise `import store`
+# only resolves when the CWD happens to be the repo root.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
+sys.path.insert(0, _REPO_ROOT)
+sys.path.insert(0, _HERE)
+
+from store import MemoryStore  # noqa: E402
+from recall import recall, format_for_system_prompt, MAX_CONTEXT_CHARS  # noqa: E402
+from extract import extract_atoms, deduplicate_atoms  # noqa: E402
+from aggregate import build_scenarios, build_persona  # noqa: E402
+from test_pipeline import SEED_CONVERSATIONS  # noqa: E402  (shared frozen corpus)
 
 load_dotenv(os.path.join(_REPO_ROOT, ".env.proxy.local"))
 load_dotenv(os.path.join(_REPO_ROOT, ".env.proxy"))
-
-sys.path.insert(0, os.path.dirname(_HERE))
-sys.path.insert(0, _HERE)
 
 
 # ── Config ──
