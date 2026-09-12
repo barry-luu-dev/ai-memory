@@ -43,22 +43,7 @@ import json
 import argparse
 
 from openai import OpenAI
-
-# Make the repo root importable (store/recall/extract/aggregate) and the
-# scripts dir importable (test_pipeline for the shared seed corpus).
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv(os.path.join(_REPO_ROOT, ".env.proxy.local"))
-    load_dotenv(os.path.join(_REPO_ROOT, ".env.proxy"))
-except ImportError:  # python-dotenv is optional; fall back to shell env
-    pass
-
-sys.path.insert(0, os.path.dirname(_HERE))
-sys.path.insert(0, _HERE)
+from dotenv import load_dotenv
 
 from store import MemoryStore
 from recall import recall, format_for_system_prompt, MAX_CONTEXT_CHARS
@@ -66,12 +51,22 @@ from extract import extract_atoms, deduplicate_atoms
 from aggregate import build_scenarios, build_persona
 from test_pipeline import SEED_CONVERSATIONS  # shared frozen corpus
 
+# Make the repo root importable (store/recall/extract/aggregate) and the
+# scripts dir importable (test_pipeline for the shared seed corpus).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_HERE)
+
+load_dotenv(os.path.join(_REPO_ROOT, ".env.proxy.local"))
+load_dotenv(os.path.join(_REPO_ROOT, ".env.proxy"))
+
+sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, _HERE)
+
 
 # ── Config ──
 
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
-# Never hardcode a key here — load it from the environment (e.g. `.env.proxy.local`).
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 JUDGE_MODEL = os.getenv("JUDGE_MODEL", LLM_MODEL)
 
